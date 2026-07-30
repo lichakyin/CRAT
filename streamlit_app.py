@@ -1,13 +1,17 @@
 """
 CRAT Analyzer — Children Reading Acuity Test
 
-Streamlit application for CRAT data entry, reading-speed calculation,
-curve fitting, clinical metric calculation, and visualization.
+Streamlit app for:
+1. CRAT clinical data entry
+2. Reading speed calculation
+3. CRA calculation
+4. Exponential decay-to-asymptote fitting
+5. CMRS and CCPS calculation
+6. Altair visualization
 
-This version does NOT require matplotlib or seaborn.
-It uses Altair for plotting and has a fallback fitting method if scipy is unavailable.
+This version avoids matplotlib/seaborn to prevent deployment issues on Streamlit Cloud.
 
-Run locally:
+Run:
     streamlit run streamlit_app.py
 """
 
@@ -23,7 +27,6 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
-# scipy is optional. If unavailable, the app still runs using a grid-search fallback.
 try:
     from scipy.optimize import curve_fit
     SCIPY_AVAILABLE = True
@@ -33,7 +36,7 @@ except Exception:
 
 
 # ============================================================
-# Streamlit Page Configuration
+# Page configuration
 # ============================================================
 
 st.set_page_config(
@@ -50,19 +53,34 @@ st.set_page_config(
 
 N_CHARACTERS_PER_CARD = 18
 
-# 17 print sizes from 1.3 to -0.3 logMAR in steps of 0.1
+# CRAT has 17 cards from 1.3 to -0.3 logMAR in 0.1 steps.
 PRINT_SIZES = np.round(np.arange(1.3, -0.31, -0.1), 1)
+
+# Clinical default for CCPS.
+DEFAULT_CCPS_THRESHOLD_PERCENT = 90
 
 
 # ============================================================
-# Core Calculations
+# Core CRAT calculations
 # ============================================================
 
 def calculate_reading_speed(time_seconds: float, errors: int) -> float:
     """
-    Calculate Chinese Reading Speed.
+    Calculate Chinese Reading Speed, CRS.
 
     CRS = 60 * (18 - errors) / time_seconds
+
+    Parameters
+    ----------
+    time_seconds : float
+        Reading time in seconds.
+    errors : int
+        Number of reading errors.
+
+    Returns
+    -------
+    float
+        Reading speed in characters per minute.
     """
     if pd.isna(time_seconds) or time_seconds <= 0:
         return np.nan
@@ -75,127 +93,183 @@ def calculate_reading_speed(time_seconds: float, errors: int) -> float:
 
 def calculate_cra(number_attempted: int, cumulative_errors: int) -> float:
     """
-    Calculate Chinese Reading Acuity.
+    Calculate Chinese Reading Acuity, CRA.
 
     CRA = 1.4 - (Number of sentences read * 0.1)
           + (Total cumulative errors * 0.0056)
+
+    Here, "sentences read" is interpreted as the number of CRAT cards attempted.
     """
     return 1.4 - (number_attempted * 0.1) + (cumulative_errors * 0.0056)
 
 
-def exponential_plateau_model(x, plateau, bottom, rate, x_shift):
-    """
-    Exponential rise-to-plateau model.
+# ============================================================
+# Exponential decay-to-asymptote model
+# ============================================================
 
-    y = bottom + (plateau - bottom) * (1 - exp(-rate * max(x - x_shift, 0)))
+def exponential_decay_to_asymptote(x, cmrs, amplitude, rate):
+    """
+    Exponential decay-to-asymptote model for reading speed.
+
+    Model:
+        y = CMRS - amplitude * exp(-rate * (x - x_ref))
+
+    In this app, x_ref is fixed globally during fitting to the smallest
+    print size in the fitted range. To keep curve_fit simple, x_ref is
+    handled by transforming x before calling this function.
+
+    Equivalent transformed model:
+        y = CMRS - amplitude * exp(-rate * x_transformed)
+
+    where:
+        x_transformed = x - x_ref
 
     Interpretation:
-    - plateau = CMRS
-    - x is print size in logMAR
+    - CMRS is the asymptotic maximum reading speed.
+    - amplitude determines how far below CMRS the curve starts.
+    - rate controls how quickly reading speed approaches CMRS.
+    """
+    return cmrs - amplitude * np.exp(-rate * x)
+
+
+def predict_exponential_decay(x_original, params, x_ref):
+    """
+    Predict reading speed from the fitted exponential decay-to-asymptote model.
+
+    Parameters
+    ----------
+    x_original : array-like
+        Original print size in logMAR.
+    params : array-like
+        Fitted parameters [cmrs, amplitude, rate].
+    x_ref : float
+        Reference x-value used for transformation.
+
+    Returns
+    -------
+    array-like
+        Predicted reading speed.
+    """
+    cmrs, amplitude, rate = params
+    x_transformed = np.asarray(x_original, dtype=float) - x_ref
+    return exponential_decay_to_asymptote(x_transformed, cmrs, amplitude, rate)
+
+
+def fit_exponential_decay_scipy(x, y):
+    """
+    Fit the exponential decay-to-asymptote model using scipy curve_fit.
+
+    The model is:
+        y = CMRS - amplitude * exp(-rate * (x - x_ref))
+
+    x_ref is chosen as the smallest x-value among valid tested cards.
     """
     x = np.asarray(x, dtype=float)
-    effective_x = np.maximum(x - x_shift, 0)
-    return bottom + (plateau - bottom) * (1 - np.exp(-rate * effective_x))
+    y = np.asarray(y, dtype=float)
 
+    x_ref = float(np.nanmin(x))
+    x_transformed = x - x_ref
 
-def fit_with_scipy(x, y):
-    """
-    Fit model using scipy.optimize.curve_fit.
-    """
-    plateau_init = max(float(np.nanmax(y)), 1.0)
-    bottom_init = max(float(np.nanmin(y)), 0.0)
+    y_max = float(np.nanmax(y))
+    y_min = float(np.nanmin(y))
+    y_range = max(y_max - y_min, 1.0)
+
+    # Initial guesses
+    cmrs_init = max(y_max * 1.05, y_max + 1.0)
+    amplitude_init = max(cmrs_init - y_min, 1.0)
     rate_init = 3.0
-    x_shift_init = float(np.nanmin(x))
 
-    p0 = [plateau_init, bottom_init, rate_init, x_shift_init]
+    p0 = [cmrs_init, amplitude_init, rate_init]
 
+    # Bounds
     lower_bounds = [
-        0.0,      # plateau
-        0.0,      # bottom
-        0.01,     # rate
-        -0.6,     # x_shift
+        y_max,       # CMRS should be at least observed maximum speed
+        0.0,         # amplitude
+        0.001,       # rate
     ]
 
     upper_bounds = [
-        max(plateau_init * 3.0, 500.0),  # plateau
-        max(plateau_init * 2.0, 400.0),  # bottom
-        50.0,                            # rate
-        1.5,                             # x_shift
+        max(y_max * 3.0, 500.0),   # CMRS
+        max(y_range * 10.0, 500.0), # amplitude
+        50.0,                      # rate
     ]
 
-    popt, _ = curve_fit(
-        exponential_plateau_model,
-        x,
+    popt, pcov = curve_fit(
+        exponential_decay_to_asymptote,
+        x_transformed,
         y,
         p0=p0,
         bounds=(lower_bounds, upper_bounds),
         maxfev=20000,
     )
 
-    return popt
+    return popt, pcov, x_ref
 
 
-def fit_with_grid_search(x, y):
+def fit_exponential_decay_grid_search(x, y):
     """
-    Fallback non-linear fitting method that does not require scipy.
+    Fallback fitting method if scipy is unavailable.
 
-    This is less sophisticated than scipy curve_fit but allows the app
-    to continue running if scipy is unavailable on Streamlit Cloud.
+    This performs a simple grid search over CMRS, amplitude, and rate.
+    It is less precise than scipy curve_fit but keeps the app functional.
     """
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
 
-    y_max = max(float(np.nanmax(y)), 1.0)
-    y_min = max(float(np.nanmin(y)), 0.0)
+    x_ref = float(np.nanmin(x))
+    x_transformed = x - x_ref
 
-    plateau_candidates = np.linspace(y_max, max(y_max * 1.8, y_max + 50), 25)
-    bottom_candidates = np.linspace(0, y_min, 15)
-    rate_candidates = np.linspace(0.5, 15.0, 30)
-    x_shift_candidates = np.linspace(-0.5, min(float(np.nanmin(x)), 0.5), 25)
+    y_max = float(np.nanmax(y))
+    y_min = float(np.nanmin(y))
+    y_range = max(y_max - y_min, 1.0)
+
+    cmrs_candidates = np.linspace(y_max, max(y_max * 1.8, y_max + 80.0), 50)
+    amplitude_candidates = np.linspace(0.0, max(y_range * 5.0, 300.0), 50)
+    rate_candidates = np.linspace(0.1, 20.0, 60)
 
     best_params = None
     best_sse = np.inf
 
-    for plateau in plateau_candidates:
-        for bottom in bottom_candidates:
-            if plateau <= bottom:
-                continue
-
+    for cmrs in cmrs_candidates:
+        for amplitude in amplitude_candidates:
             for rate in rate_candidates:
-                for x_shift in x_shift_candidates:
-                    y_pred = exponential_plateau_model(
-                        x,
-                        plateau,
-                        bottom,
-                        rate,
-                        x_shift,
-                    )
-                    sse = np.sum((y - y_pred) ** 2)
+                y_pred = exponential_decay_to_asymptote(
+                    x_transformed,
+                    cmrs,
+                    amplitude,
+                    rate,
+                )
 
-                    if sse < best_sse:
-                        best_sse = sse
-                        best_params = [plateau, bottom, rate, x_shift]
+                sse = np.sum((y - y_pred) ** 2)
 
-    return np.asarray(best_params, dtype=float)
+                if sse < best_sse:
+                    best_sse = sse
+                    best_params = np.array([cmrs, amplitude, rate], dtype=float)
+
+    return best_params, None, x_ref
 
 
 def fit_reading_curve(df_valid: pd.DataFrame):
     """
-    Fit the CRAT reading-speed curve.
+    Fit reading speed against print size using the exponential decay-to-asymptote model.
 
-    Returns a dictionary with:
-    - success
-    - method
-    - params
-    - x_fit
-    - y_fit
-    - cmrs
-    - message
+    Parameters
+    ----------
+    df_valid : pd.DataFrame
+        DataFrame with valid rows containing:
+        - Print Size logMAR
+        - CRS chars/min
+
+    Returns
+    -------
+    dict
+        Fit results.
     """
     result = {
         "success": False,
         "method": None,
         "params": None,
+        "x_ref": None,
         "x_fit": None,
         "y_fit": None,
         "cmrs": np.nan,
@@ -203,7 +277,7 @@ def fit_reading_curve(df_valid: pd.DataFrame):
     }
 
     if df_valid.empty:
-        result["message"] = "No valid data available for curve fitting."
+        result["message"] = "No valid CRAT data available for curve fitting."
         return result
 
     x = df_valid["Print Size logMAR"].to_numpy(dtype=float)
@@ -215,11 +289,12 @@ def fit_reading_curve(df_valid: pd.DataFrame):
 
     if len(x) < 3:
         result["message"] = (
-            "Insufficient valid data for non-linear fitting. "
+            "Insufficient valid data for exponential fitting. "
             "At least 3 valid tested cards are recommended."
         )
         return result
 
+    # Sort by print size ascending for stable fitting.
     order = np.argsort(x)
     x = x[order]
     y = y[order]
@@ -228,75 +303,100 @@ def fit_reading_curve(df_valid: pd.DataFrame):
         if SCIPY_AVAILABLE:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                params = fit_with_scipy(x, y)
+                params, pcov, x_ref = fit_exponential_decay_scipy(x, y)
 
-            method = "Non-linear exponential plateau model using scipy"
+            method = "Exponential decay-to-asymptote model using scipy"
 
         else:
-            params = fit_with_grid_search(x, y)
-            method = "Non-linear exponential plateau model using fallback grid search"
+            params, pcov, x_ref = fit_exponential_decay_grid_search(x, y)
+            method = "Exponential decay-to-asymptote model using fallback grid search"
 
-        x_fit = np.linspace(-0.4, 1.4, 500)
-        y_fit = exponential_plateau_model(x_fit, *params)
+        x_fit = np.linspace(-0.4, 1.4, 600)
+        y_fit = predict_exponential_decay(x_fit, params, x_ref)
 
-        plateau = float(params[0])
+        cmrs = float(params[0])
 
         result.update(
             {
                 "success": True,
                 "method": method,
                 "params": params,
+                "x_ref": x_ref,
                 "x_fit": x_fit,
                 "y_fit": y_fit,
-                "cmrs": plateau,
-                "message": "Curve fit completed successfully.",
+                "cmrs": cmrs,
+                "message": "Exponential decay-to-asymptote fitting completed successfully.",
             }
         )
 
         return result
 
     except Exception as exc:
-        result["message"] = f"Curve fitting failed: {exc}"
+        result["message"] = f"Exponential fitting failed: {exc}"
         return result
 
 
-def calculate_ccps(fit_result: dict, threshold_fraction: float):
+def calculate_ccps_from_exponential_decay(fit_result: dict, threshold_fraction: float = 0.90):
     """
-    Calculate CCPS from fitted model.
+    Calculate Chinese Critical Print Size, CCPS.
 
-    CCPS = x where fitted speed reaches threshold_fraction * CMRS.
+    CCPS is defined as the print size where the fitted reading speed reaches:
+
+        threshold_fraction * CMRS
+
+    For model:
+        y = CMRS - amplitude * exp(-rate * (x - x_ref))
+
+    Solve for x:
+
+        threshold * CMRS = CMRS - amplitude * exp(-rate * (x - x_ref))
+
+        amplitude * exp(-rate * (x - x_ref)) = CMRS - threshold * CMRS
+
+        exp(-rate * (x - x_ref)) = CMRS * (1 - threshold) / amplitude
+
+        x = x_ref - ln[CMRS * (1 - threshold) / amplitude] / rate
+
+    Returns
+    -------
+    tuple
+        ccps, threshold_speed
     """
     cmrs = fit_result.get("cmrs", np.nan)
     params = fit_result.get("params", None)
+    x_ref = fit_result.get("x_ref", None)
 
-    if not np.isfinite(cmrs) or cmrs <= 0 or params is None:
+    if params is None or x_ref is None:
         return np.nan, np.nan
+
+    if not np.isfinite(cmrs) or cmrs <= 0:
+        return np.nan, np.nan
+
+    cmrs, amplitude, rate = params
 
     threshold_speed = threshold_fraction * cmrs
 
-    plateau, bottom, rate, x_shift = params
-    denominator = plateau - bottom
+    if amplitude <= 0 or rate <= 0:
+        return np.nan, float(threshold_speed)
 
-    if denominator <= 0 or rate <= 0:
-        return np.nan, threshold_speed
+    ratio = (cmrs - threshold_speed) / amplitude
 
-    proportion = (threshold_speed - bottom) / denominator
+    if ratio <= 0:
+        return np.nan, float(threshold_speed)
 
-    if proportion <= 0:
-        ccps = x_shift
-    elif proportion >= 1:
-        ccps = np.nan
-    else:
-        ccps = x_shift - np.log(1.0 - proportion) / rate
+    ccps = x_ref - np.log(ratio) / rate
 
     return float(ccps), float(threshold_speed)
 
 
 # ============================================================
-# Session State
+# Data initialization
 # ============================================================
 
 def make_default_dataframe():
+    """
+    Create default CRAT data-entry table.
+    """
     return pd.DataFrame(
         {
             "Tested": [True] * len(PRINT_SIZES),
@@ -312,99 +412,127 @@ if "crat_data" not in st.session_state:
 
 
 # ============================================================
-# Sidebar
+# Sidebar controls
 # ============================================================
 
 st.sidebar.title("CRAT Controls")
 
+st.sidebar.markdown("### CCPS threshold")
+
 threshold_percent = st.sidebar.slider(
-    "CCPS threshold percentage",
+    "Percent of CMRS used for CCPS",
     min_value=80,
     max_value=95,
-    value=90,
+    value=DEFAULT_CCPS_THRESHOLD_PERCENT,
     step=1,
-    help="CCPS is the logMAR print size where speed reaches this percentage of CMRS.",
+    help=(
+        "CRAT critical print size is commonly calculated at 90% of "
+        "maximum reading speed."
+    ),
 )
 
 threshold_fraction = threshold_percent / 100.0
 
 st.sidebar.markdown("---")
 
-if st.sidebar.button("Reset table"):
+if st.sidebar.button("Reset CRAT table"):
     st.session_state["crat_data"] = make_default_dataframe()
     st.rerun()
 
-st.sidebar.markdown("### Dependency status")
+st.sidebar.markdown("### Fitting method")
+
+st.sidebar.info(
+    """
+    The app fits an exponential decay-to-asymptote model:
+
+    y = CMRS - A × exp[-k × (x - x_ref)]
+
+    CCPS is calculated at 90% of CMRS by default.
+    """
+)
 
 if SCIPY_AVAILABLE:
     st.sidebar.success("scipy available")
 else:
-    st.sidebar.warning("scipy unavailable. Using fallback fitting.")
-
-st.sidebar.info(
-    "This version does not require matplotlib or seaborn."
-)
+    st.sidebar.warning("scipy unavailable. Using fallback grid-search fitting.")
 
 
 # ============================================================
-# Main Interface
+# Main title
 # ============================================================
 
 st.title("Children Reading Acuity Test CRAT Analyzer")
 
 st.caption(
-    "Clinical tool for calculating CRS, CRA, CMRS, and CCPS from CRAT data."
+    "Clinical tool for calculating CRS, CRA, CMRS, and CCPS using an "
+    "exponential decay-to-asymptote model."
 )
 
-with st.expander("Mathematical definitions", expanded=False):
+with st.expander("Model and clinical definitions", expanded=False):
     st.markdown(
         r"""
-        **Chinese Reading Speed CRS**
+        ### Chinese Reading Speed CRS
 
         $$
         CRS = \frac{60 \times (18 - Errors)}{Time}
         $$
 
-        **Chinese Reading Acuity CRA**
+        ### Chinese Reading Acuity CRA
 
         $$
         CRA = 1.4 - (Number\ of\ sentences\ read \times 0.1)
         + (Total\ cumulative\ errors \times 0.0056)
         $$
 
-        **Curve model**
+        ### Exponential decay-to-asymptote fitting model
 
         $$
-        y = bottom + (plateau - bottom)
-        \left(1 - e^{-rate \cdot max(x - x_{shift}, 0)}\right)
+        y = CMRS - A e^{-k(x - x_{ref})}
         $$
 
-        The fitted plateau is interpreted as **CMRS**.
+        where:
+
+        - $$y$$ is reading speed in characters/min.
+        - $$x$$ is print size in logMAR.
+        - $$CMRS$$ is the asymptotic Chinese Maximum Reading Speed.
+        - $$A$$ is the amplitude.
+        - $$k$$ is the exponential rate constant.
+        - $$x_{ref}$$ is the smallest fitted print size.
+
+        ### CCPS
+
+        Chinese Critical Print Size is calculated as the print size where:
+
+        $$
+        y = 0.90 \times CMRS
+        $$
+
+        by default.
         """
     )
 
 
 # ============================================================
-# Patient Information
+# Patient information
 # ============================================================
 
 st.header("1. Patient Information")
 
-col1, col2, col3 = st.columns([2, 2, 1])
+col_patient_1, col_patient_2, col_patient_3 = st.columns([2, 2, 1])
 
-with col1:
+with col_patient_1:
     patient_id = st.text_input(
         "Patient ID / Name",
         placeholder="Enter patient ID or name",
     )
 
-with col2:
+with col_patient_2:
     examiner = st.text_input(
         "Examiner",
         placeholder="Optional",
     )
 
-with col3:
+with col_patient_3:
     test_date = st.date_input(
         "Test date",
         value=datetime.today(),
@@ -412,14 +540,14 @@ with col3:
 
 
 # ============================================================
-# Data Entry
+# Data entry
 # ============================================================
 
 st.header("2. CRAT Data Entry")
 
 st.write(
-    "Enter reading time and number of errors for each card. "
-    "Uncheck **Tested** for skipped or untested cards."
+    "Enter reading time and errors for each card. "
+    "Uncheck **Tested** for cards that were skipped or not tested."
 )
 
 edited_df = st.data_editor(
@@ -430,7 +558,7 @@ edited_df = st.data_editor(
     column_config={
         "Tested": st.column_config.CheckboxColumn(
             "Tested",
-            help="Uncheck if the card was skipped or not tested.",
+            help="Uncheck if this card was skipped or not tested.",
             default=True,
         ),
         "Print Size logMAR": st.column_config.NumberColumn(
@@ -461,7 +589,7 @@ st.session_state["crat_data"] = edited_df.copy()
 
 
 # ============================================================
-# Processing
+# Data processing
 # ============================================================
 
 df = edited_df.copy()
@@ -494,33 +622,37 @@ cra = calculate_cra(number_attempted, cumulative_errors)
 fit_result = fit_reading_curve(df_valid)
 
 cmrs = fit_result.get("cmrs", np.nan)
-ccps, threshold_speed = calculate_ccps(fit_result, threshold_fraction)
+
+ccps, threshold_speed = calculate_ccps_from_exponential_decay(
+    fit_result,
+    threshold_fraction=threshold_fraction,
+)
 
 
 # ============================================================
-# Clinical Results
+# Clinical results
 # ============================================================
 
 st.header("3. Clinical Results")
 
-m1, m2, m3, m4, m5 = st.columns(5)
+metric_1, metric_2, metric_3, metric_4, metric_5 = st.columns(5)
 
-with m1:
+with metric_1:
     st.metric("Cards attempted", number_attempted)
 
-with m2:
+with metric_2:
     st.metric("Cumulative errors", cumulative_errors)
 
-with m3:
+with metric_3:
     st.metric("CRA", f"{cra:.3f} logMAR")
 
-with m4:
+with metric_4:
     st.metric(
         "CMRS",
         f"{cmrs:.1f} chars/min" if np.isfinite(cmrs) else "NA",
     )
 
-with m5:
+with metric_5:
     st.metric(
         f"CCPS at {threshold_percent}%",
         f"{ccps:.3f} logMAR" if np.isfinite(ccps) else "NA",
@@ -533,12 +665,13 @@ else:
 
 if number_attempted > 0 and len(df_valid) < number_attempted:
     st.warning(
-        "Some tested cards have missing or invalid times and were excluded from fitting."
+        "Some tested cards have missing or invalid reading times and were excluded "
+        "from CRS calculation and curve fitting."
     )
 
 
 # ============================================================
-# Processed Data
+# Processed data table
 # ============================================================
 
 st.header("4. Processed Data")
@@ -554,14 +687,14 @@ st.dataframe(
 
 
 # ============================================================
-# Visualization with Altair
+# Visualization using Altair
 # ============================================================
 
 st.header("5. CRAT Reading-Speed Curve")
 
 chart_layers = []
 
-# Observed data
+# Observed CRS data
 observed_df = df_valid[
     ["Print Size logMAR", "CRS chars/min"]
 ].copy()
@@ -569,7 +702,7 @@ observed_df = df_valid[
 if not observed_df.empty:
     observed_points = (
         alt.Chart(observed_df)
-        .mark_circle(size=100, color="#1f77b4", opacity=0.9)
+        .mark_circle(size=110, color="#1f77b4", opacity=0.9)
         .encode(
             x=alt.X(
                 "Print Size logMAR:Q",
@@ -642,7 +775,9 @@ if np.isfinite(threshold_speed):
     threshold_df = pd.DataFrame(
         {
             "y": [threshold_speed],
-            "label": [f"{threshold_percent}% CMRS = {threshold_speed:.1f} chars/min"],
+            "label": [
+                f"{threshold_percent}% CMRS = {threshold_speed:.1f} chars/min"
+            ],
         }
     )
 
@@ -699,12 +834,12 @@ if chart_layers:
         alt.layer(*chart_layers)
         .properties(
             width="container",
-            height=520,
+            height=540,
             title="CRAT Reading Speed vs. Print Size",
         )
         .resolve_scale(
-            y="shared",
             x="shared",
+            y="shared",
         )
         .configure_axis(
             grid=True,
@@ -719,24 +854,34 @@ if chart_layers:
 
     st.altair_chart(final_chart, use_container_width=True)
 
+    st.markdown("### Clinical Summary")
+
     st.info(
         f"""
-        **Clinical summary**
-
-        Patient: {patient_id if patient_id else "Not specified"}  
-        CRA: {cra:.3f} logMAR  
-        CMRS: {cmrs:.1f} chars/min if available  
-        CCPS at {threshold_percent}%: {ccps:.3f} logMAR if available  
-        Fit method: {fit_result.get("method", "NA")}
+        **Patient:** {patient_id if patient_id else "Not specified"}  
+        **CRA:** {cra:.3f} logMAR  
+        **CMRS:** {cmrs:.1f} chars/min  
+        **CCPS at {threshold_percent}% CMRS:** {ccps:.3f} logMAR  
+        **Threshold speed:** {threshold_speed:.1f} chars/min  
+        **Fit method:** {fit_result.get("method", "NA")}
+        """
+        if np.isfinite(cmrs) and np.isfinite(ccps)
+        else
+        f"""
+        **Patient:** {patient_id if patient_id else "Not specified"}  
+        **CRA:** {cra:.3f} logMAR  
+        **CMRS:** NA  
+        **CCPS at {threshold_percent}% CMRS:** NA  
+        **Fit method:** {fit_result.get("method", "NA")}
         """
     )
 
 else:
-    st.info("Enter valid CRAT data to generate the chart.")
+    st.info("Enter valid CRAT data to generate the fitted curve.")
 
 
 # ============================================================
-# Export
+# Export results
 # ============================================================
 
 st.header("6. Export Results")
@@ -753,6 +898,13 @@ export_df[f"CCPS {threshold_percent}% logMAR"] = ccps
 export_df[f"Threshold Speed {threshold_percent}% chars/min"] = threshold_speed
 export_df["Fit Method"] = fit_result.get("method")
 export_df["Fit Message"] = fit_result.get("message")
+
+if fit_result.get("params") is not None:
+    params = fit_result["params"]
+    export_df["Fit CMRS parameter"] = params[0]
+    export_df["Fit amplitude parameter"] = params[1]
+    export_df["Fit rate parameter"] = params[2]
+    export_df["Fit x_ref"] = fit_result.get("x_ref")
 
 csv = export_df.to_csv(index=False).encode("utf-8-sig")
 
