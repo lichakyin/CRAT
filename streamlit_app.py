@@ -1,36 +1,35 @@
 """
 CRAT Analyzer — Children Reading Acuity Test
 
-Streamlit application for clinical data entry, reading-speed calculation,
-non-linear curve fitting, and visualization of CRAT results.
+Streamlit application for CRAT data entry, reading-speed calculation,
+curve fitting, clinical metric calculation, and visualization.
 
-Run with:
-    streamlit run crat_analyzer.py
+This version does NOT require matplotlib or seaborn.
+It uses Altair for plotting and has a fallback fitting method if scipy is unavailable.
+
+Run locally:
+    streamlit run streamlit_app.py
 """
-####
+
 # ============================================================
 # Imports
 # ============================================================
-import warnings
+
 from datetime import datetime
+import warnings
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import altair as alt
 
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-from scipy.optimize import curve_fit
-from scipy.interpolate import interp1d
-
-# Included per requirement.
-# Note: Streamlit does not natively render ipywidgets in the same way as Jupyter.
-# This app uses Streamlit-native widgets for production-ready deployment.
+# scipy is optional. If unavailable, the app still runs using a grid-search fallback.
 try:
-    import ipywidgets as widgets  # noqa: F401
-except ImportError:
-    widgets = None
+    from scipy.optimize import curve_fit
+    SCIPY_AVAILABLE = True
+except Exception:
+    curve_fit = None
+    SCIPY_AVAILABLE = False
 
 
 # ============================================================
@@ -44,8 +43,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-sns.set_theme(style="whitegrid", context="talk")
-
 
 # ============================================================
 # Constants
@@ -53,62 +50,35 @@ sns.set_theme(style="whitegrid", context="talk")
 
 N_CHARACTERS_PER_CARD = 18
 
-# CRAT print sizes: 1.3 to -0.3 logMAR in steps of 0.1
+# 17 print sizes from 1.3 to -0.3 logMAR in steps of 0.1
 PRINT_SIZES = np.round(np.arange(1.3, -0.31, -0.1), 1)
-
-DEFAULT_TIME_SECONDS = np.nan
-DEFAULT_ERRORS = 0
 
 
 # ============================================================
-# Mathematical Functions
+# Core Calculations
 # ============================================================
 
 def calculate_reading_speed(time_seconds: float, errors: int) -> float:
     """
-    Calculate Chinese Reading Speed, CRS.
+    Calculate Chinese Reading Speed.
 
-    CRS = 60 * (18 - Reading Errors) / Reading Time
-
-    Parameters
-    ----------
-    time_seconds : float
-        Reading time in seconds.
-    errors : int
-        Number of reading errors.
-
-    Returns
-    -------
-    float
-        Reading speed in characters per minute.
+    CRS = 60 * (18 - errors) / time_seconds
     """
     if pd.isna(time_seconds) or time_seconds <= 0:
         return np.nan
 
-    errors = max(0, min(int(errors), N_CHARACTERS_PER_CARD))
-    correct_chars = N_CHARACTERS_PER_CARD - errors
+    errors = int(np.clip(errors, 0, N_CHARACTERS_PER_CARD))
+    correct_characters = N_CHARACTERS_PER_CARD - errors
 
-    return 60.0 * correct_chars / time_seconds
+    return 60.0 * correct_characters / float(time_seconds)
 
 
 def calculate_cra(number_attempted: int, cumulative_errors: int) -> float:
     """
-    Calculate Chinese Reading Acuity, CRA.
+    Calculate Chinese Reading Acuity.
 
     CRA = 1.4 - (Number of sentences read * 0.1)
           + (Total cumulative errors * 0.0056)
-
-    Parameters
-    ----------
-    number_attempted : int
-        Number of tested/attempted CRAT cards.
-    cumulative_errors : int
-        Total cumulative reading errors across attempted cards.
-
-    Returns
-    -------
-    float
-        Chinese Reading Acuity in logMAR.
     """
     return 1.4 - (number_attempted * 0.1) + (cumulative_errors * 0.0056)
 
@@ -117,307 +87,273 @@ def exponential_plateau_model(x, plateau, bottom, rate, x_shift):
     """
     Exponential rise-to-plateau model.
 
-    This model assumes reading speed increases as print size becomes larger
-    and approaches an asymptotic plateau.
-
     y = bottom + (plateau - bottom) * (1 - exp(-rate * max(x - x_shift, 0)))
 
-    Parameters
-    ----------
-    x : array-like
-        Print size in logMAR.
-    plateau : float
-        Asymptotic maximum reading speed, i.e., CMRS.
-    bottom : float
-        Lower asymptote / floor reading speed.
-    rate : float
-        Growth rate.
-    x_shift : float
-        Horizontal shift / approximate starting point of growth.
-
-    Returns
-    -------
-    array-like
-        Predicted reading speed.
+    Interpretation:
+    - plateau = CMRS
+    - x is print size in logMAR
     """
-    x = np.asarray(x)
+    x = np.asarray(x, dtype=float)
     effective_x = np.maximum(x - x_shift, 0)
     return bottom + (plateau - bottom) * (1 - np.exp(-rate * effective_x))
 
 
+def fit_with_scipy(x, y):
+    """
+    Fit model using scipy.optimize.curve_fit.
+    """
+    plateau_init = max(float(np.nanmax(y)), 1.0)
+    bottom_init = max(float(np.nanmin(y)), 0.0)
+    rate_init = 3.0
+    x_shift_init = float(np.nanmin(x))
+
+    p0 = [plateau_init, bottom_init, rate_init, x_shift_init]
+
+    lower_bounds = [
+        0.0,      # plateau
+        0.0,      # bottom
+        0.01,     # rate
+        -0.6,     # x_shift
+    ]
+
+    upper_bounds = [
+        max(plateau_init * 3.0, 500.0),  # plateau
+        max(plateau_init * 2.0, 400.0),  # bottom
+        50.0,                            # rate
+        1.5,                             # x_shift
+    ]
+
+    popt, _ = curve_fit(
+        exponential_plateau_model,
+        x,
+        y,
+        p0=p0,
+        bounds=(lower_bounds, upper_bounds),
+        maxfev=20000,
+    )
+
+    return popt
+
+
+def fit_with_grid_search(x, y):
+    """
+    Fallback non-linear fitting method that does not require scipy.
+
+    This is less sophisticated than scipy curve_fit but allows the app
+    to continue running if scipy is unavailable on Streamlit Cloud.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    y_max = max(float(np.nanmax(y)), 1.0)
+    y_min = max(float(np.nanmin(y)), 0.0)
+
+    plateau_candidates = np.linspace(y_max, max(y_max * 1.8, y_max + 50), 25)
+    bottom_candidates = np.linspace(0, y_min, 15)
+    rate_candidates = np.linspace(0.5, 15.0, 30)
+    x_shift_candidates = np.linspace(-0.5, min(float(np.nanmin(x)), 0.5), 25)
+
+    best_params = None
+    best_sse = np.inf
+
+    for plateau in plateau_candidates:
+        for bottom in bottom_candidates:
+            if plateau <= bottom:
+                continue
+
+            for rate in rate_candidates:
+                for x_shift in x_shift_candidates:
+                    y_pred = exponential_plateau_model(
+                        x,
+                        plateau,
+                        bottom,
+                        rate,
+                        x_shift,
+                    )
+                    sse = np.sum((y - y_pred) ** 2)
+
+                    if sse < best_sse:
+                        best_sse = sse
+                        best_params = [plateau, bottom, rate, x_shift]
+
+    return np.asarray(best_params, dtype=float)
+
+
 def fit_reading_curve(df_valid: pd.DataFrame):
     """
-    Fit exponential plateau curve to valid CRAT data.
+    Fit the CRAT reading-speed curve.
 
-    Parameters
-    ----------
-    df_valid : pd.DataFrame
-        DataFrame containing valid tested rows with columns:
-        'Print Size logMAR' and 'CRS chars/min'.
-
-    Returns
-    -------
-    dict
-        Dictionary containing fitting results and metadata.
+    Returns a dictionary with:
+    - success
+    - method
+    - params
+    - x_fit
+    - y_fit
+    - cmrs
+    - message
     """
-    x = df_valid["Print Size logMAR"].to_numpy(dtype=float)
-    y = df_valid["CRS chars/min"].to_numpy(dtype=float)
-
-    valid_mask = np.isfinite(x) & np.isfinite(y)
-    x = x[valid_mask]
-    y = y[valid_mask]
-
     result = {
         "success": False,
         "method": None,
         "params": None,
-        "message": "",
         "x_fit": None,
         "y_fit": None,
         "cmrs": np.nan,
+        "message": "",
     }
+
+    if df_valid.empty:
+        result["message"] = "No valid data available for curve fitting."
+        return result
+
+    x = df_valid["Print Size logMAR"].to_numpy(dtype=float)
+    y = df_valid["CRS chars/min"].to_numpy(dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
 
     if len(x) < 3:
         result["message"] = (
-            "Insufficient valid data for non-linear curve fitting. "
+            "Insufficient valid data for non-linear fitting. "
             "At least 3 valid tested cards are recommended."
         )
         return result
 
-    # Sort by ascending print size for fitting/interpolation.
     order = np.argsort(x)
-    x_sorted = x[order]
-    y_sorted = y[order]
+    x = x[order]
+    y = y[order]
 
     try:
-        plateau_init = max(np.nanmax(y_sorted), 1.0)
-        bottom_init = max(np.nanmin(y_sorted), 0.0)
-        rate_init = 3.0
-        x_shift_init = min(x_sorted)
+        if SCIPY_AVAILABLE:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                params = fit_with_scipy(x, y)
 
-        p0 = [plateau_init, bottom_init, rate_init, x_shift_init]
+            method = "Non-linear exponential plateau model using scipy"
 
-        lower_bounds = [
-            0.0,                 # plateau
-            0.0,                 # bottom
-            0.01,                # rate
-            -0.6,                # x_shift
-        ]
-
-        upper_bounds = [
-            max(plateau_init * 3, 500.0),  # plateau
-            max(plateau_init * 2, 400.0),  # bottom
-            50.0,                         # rate
-            1.5,                          # x_shift
-        ]
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            popt, pcov = curve_fit(
-                exponential_plateau_model,
-                x_sorted,
-                y_sorted,
-                p0=p0,
-                bounds=(lower_bounds, upper_bounds),
-                maxfev=20000,
-            )
-
-        plateau, bottom, rate, x_shift = popt
+        else:
+            params = fit_with_grid_search(x, y)
+            method = "Non-linear exponential plateau model using fallback grid search"
 
         x_fit = np.linspace(-0.4, 1.4, 500)
-        y_fit = exponential_plateau_model(x_fit, *popt)
+        y_fit = exponential_plateau_model(x_fit, *params)
+
+        plateau = float(params[0])
 
         result.update(
             {
                 "success": True,
-                "method": "Non-linear exponential plateau model",
-                "params": popt,
-                "covariance": pcov,
-                "message": "Curve fit completed successfully.",
+                "method": method,
+                "params": params,
                 "x_fit": x_fit,
                 "y_fit": y_fit,
                 "cmrs": plateau,
+                "message": "Curve fit completed successfully.",
             }
         )
 
         return result
 
     except Exception as exc:
-        # Graceful fallback to interpolation if curve fitting fails.
-        try:
-            unique_x, unique_idx = np.unique(x_sorted, return_index=True)
-            unique_y = y_sorted[unique_idx]
-
-            if len(unique_x) >= 2:
-                interpolation = interp1d(
-                    unique_x,
-                    unique_y,
-                    kind="linear",
-                    fill_value="extrapolate",
-                    bounds_error=False,
-                )
-
-                x_fit = np.linspace(-0.4, 1.4, 500)
-                y_fit = interpolation(x_fit)
-                cmrs = np.nanmax(unique_y)
-
-                result.update(
-                    {
-                        "success": False,
-                        "method": "Linear interpolation fallback",
-                        "params": None,
-                        "message": (
-                            "Non-linear fitting failed. "
-                            f"Using linear interpolation fallback. Details: {exc}"
-                        ),
-                        "x_fit": x_fit,
-                        "y_fit": y_fit,
-                        "cmrs": cmrs,
-                    }
-                )
-                return result
-
-        except Exception as interp_exc:
-            result["message"] = (
-                "Both non-linear fitting and interpolation failed. "
-                f"Fit error: {exc}. Interpolation error: {interp_exc}"
-            )
-            return result
-
-    return result
+        result["message"] = f"Curve fitting failed: {exc}"
+        return result
 
 
-def calculate_ccps_from_fit(fit_result: dict, threshold_fraction: float):
+def calculate_ccps(fit_result: dict, threshold_fraction: float):
     """
-    Calculate Chinese Critical Print Size, CCPS.
+    Calculate CCPS from fitted model.
 
-    CCPS is defined as the print size where fitted reading speed reaches
-    a threshold fraction of CMRS.
-
-    Parameters
-    ----------
-    fit_result : dict
-        Output from fit_reading_curve.
-    threshold_fraction : float
-        Fraction of CMRS, e.g., 0.90 for 90%.
-
-    Returns
-    -------
-    tuple
-        ccps, threshold_speed
+    CCPS = x where fitted speed reaches threshold_fraction * CMRS.
     """
     cmrs = fit_result.get("cmrs", np.nan)
+    params = fit_result.get("params", None)
 
-    if not np.isfinite(cmrs) or cmrs <= 0:
+    if not np.isfinite(cmrs) or cmrs <= 0 or params is None:
         return np.nan, np.nan
 
     threshold_speed = threshold_fraction * cmrs
 
-    # If non-linear model succeeded, solve analytically.
-    if fit_result.get("params") is not None:
-        plateau, bottom, rate, x_shift = fit_result["params"]
+    plateau, bottom, rate, x_shift = params
+    denominator = plateau - bottom
 
-        denominator = plateau - bottom
-
-        if denominator <= 0:
-            return np.nan, threshold_speed
-
-        proportion = (threshold_speed - bottom) / denominator
-
-        if proportion <= 0:
-            ccps = x_shift
-        elif proportion >= 1:
-            ccps = np.nan
-        else:
-            ccps = x_shift - np.log(1 - proportion) / rate
-
-        return ccps, threshold_speed
-
-    # Fallback for interpolation: find x closest to threshold on fitted curve.
-    x_fit = fit_result.get("x_fit")
-    y_fit = fit_result.get("y_fit")
-
-    if x_fit is None or y_fit is None:
+    if denominator <= 0 or rate <= 0:
         return np.nan, threshold_speed
 
-    finite_mask = np.isfinite(x_fit) & np.isfinite(y_fit)
-    x_fit = x_fit[finite_mask]
-    y_fit = y_fit[finite_mask]
+    proportion = (threshold_speed - bottom) / denominator
 
-    if len(x_fit) == 0:
-        return np.nan, threshold_speed
+    if proportion <= 0:
+        ccps = x_shift
+    elif proportion >= 1:
+        ccps = np.nan
+    else:
+        ccps = x_shift - np.log(1.0 - proportion) / rate
 
-    idx = np.argmin(np.abs(y_fit - threshold_speed))
-    ccps = x_fit[idx]
-
-    return ccps, threshold_speed
+    return float(ccps), float(threshold_speed)
 
 
 # ============================================================
-# Data Initialization
+# Session State
 # ============================================================
 
-def get_default_crat_dataframe():
-    """
-    Create default CRAT data-entry DataFrame.
-    """
+def make_default_dataframe():
     return pd.DataFrame(
         {
             "Tested": [True] * len(PRINT_SIZES),
             "Print Size logMAR": PRINT_SIZES,
-            "Time seconds": [DEFAULT_TIME_SECONDS] * len(PRINT_SIZES),
-            "Errors": [DEFAULT_ERRORS] * len(PRINT_SIZES),
+            "Time seconds": [np.nan] * len(PRINT_SIZES),
+            "Errors": [0] * len(PRINT_SIZES),
         }
     )
 
 
 if "crat_data" not in st.session_state:
-    st.session_state["crat_data"] = get_default_crat_dataframe()
+    st.session_state["crat_data"] = make_default_dataframe()
 
 
 # ============================================================
-# Sidebar Controls
+# Sidebar
 # ============================================================
 
 st.sidebar.title("CRAT Controls")
 
 threshold_percent = st.sidebar.slider(
-    "CCPS threshold percentage of CMRS",
+    "CCPS threshold percentage",
     min_value=80,
     max_value=95,
     value=90,
     step=1,
-    help="CCPS is the print size where reading speed reaches this percentage of CMRS.",
+    help="CCPS is the logMAR print size where speed reaches this percentage of CMRS.",
 )
 
 threshold_fraction = threshold_percent / 100.0
 
 st.sidebar.markdown("---")
 
-if st.sidebar.button("Reset CRAT table", type="secondary"):
-    st.session_state["crat_data"] = get_default_crat_dataframe()
+if st.sidebar.button("Reset table"):
+    st.session_state["crat_data"] = make_default_dataframe()
     st.rerun()
 
-st.sidebar.markdown(
-    """
-    **Clinical notes**
+st.sidebar.markdown("### Dependency status")
 
-    - CRS is calculated per card.
-    - CRA uses the number of tested cards and cumulative errors.
-    - CMRS is estimated as the fitted plateau.
-    - CCPS is calculated from the fitted curve.
-    """
+if SCIPY_AVAILABLE:
+    st.sidebar.success("scipy available")
+else:
+    st.sidebar.warning("scipy unavailable. Using fallback fitting.")
+
+st.sidebar.info(
+    "This version does not require matplotlib or seaborn."
 )
 
 
 # ============================================================
-# Main UI
+# Main Interface
 # ============================================================
 
 st.title("Children Reading Acuity Test CRAT Analyzer")
+
 st.caption(
-    "Interactive clinical tool for calculating CRA, CRS, CMRS, and CCPS "
-    "from Children Reading Acuity Test data."
+    "Clinical tool for calculating CRS, CRA, CMRS, and CCPS from CRAT data."
 )
 
 with st.expander("Mathematical definitions", expanded=False):
@@ -426,27 +362,24 @@ with st.expander("Mathematical definitions", expanded=False):
         **Chinese Reading Speed CRS**
 
         $$
-        CRS = \frac{60 \times (18 - \text{Reading Errors})}
-        {\text{Reading Time in seconds}}
+        CRS = \frac{60 \times (18 - Errors)}{Time}
         $$
 
         **Chinese Reading Acuity CRA**
 
         $$
-        CRA = 1.4 - (\text{Number of sentences read} \times 0.1)
-        + (\text{Total cumulative errors} \times 0.0056)
+        CRA = 1.4 - (Number\ of\ sentences\ read \times 0.1)
+        + (Total\ cumulative\ errors \times 0.0056)
         $$
 
         **Curve model**
 
-        An exponential rise-to-plateau model is fitted:
-
         $$
         y = bottom + (plateau - bottom)
-        \left(1 - e^{-rate \cdot \max(x - x_{shift}, 0)}\right)
+        \left(1 - e^{-rate \cdot max(x - x_{shift}, 0)}\right)
         $$
 
-        where the fitted plateau is interpreted as **CMRS**.
+        The fitted plateau is interpreted as **CMRS**.
         """
     )
 
@@ -457,23 +390,21 @@ with st.expander("Mathematical definitions", expanded=False):
 
 st.header("1. Patient Information")
 
-col_patient_1, col_patient_2, col_patient_3 = st.columns([2, 2, 1])
+col1, col2, col3 = st.columns([2, 2, 1])
 
-with col_patient_1:
+with col1:
     patient_id = st.text_input(
         "Patient ID / Name",
-        value="",
         placeholder="Enter patient ID or name",
     )
 
-with col_patient_2:
+with col2:
     examiner = st.text_input(
         "Examiner",
-        value="",
         placeholder="Optional",
     )
 
-with col_patient_3:
+with col3:
     test_date = st.date_input(
         "Test date",
         value=datetime.today(),
@@ -486,11 +417,9 @@ with col_patient_3:
 
 st.header("2. CRAT Data Entry")
 
-st.markdown(
-    """
-    Enter reading time and errors for each card.  
-    Uncheck **Tested** for skipped or untested cards.
-    """
+st.write(
+    "Enter reading time and number of errors for each card. "
+    "Uncheck **Tested** for skipped or untested cards."
 )
 
 edited_df = st.data_editor(
@@ -501,29 +430,28 @@ edited_df = st.data_editor(
     column_config={
         "Tested": st.column_config.CheckboxColumn(
             "Tested",
-            help="Uncheck if this card was skipped or not tested.",
+            help="Uncheck if the card was skipped or not tested.",
             default=True,
         ),
         "Print Size logMAR": st.column_config.NumberColumn(
             "Print Size logMAR",
-            help="CRAT print size in logMAR.",
             format="%.1f",
             disabled=True,
         ),
         "Time seconds": st.column_config.NumberColumn(
             "Time seconds",
-            help="Reading time in seconds. Must be > 0 for tested cards.",
             min_value=0.0,
             step=0.1,
             format="%.2f",
+            help="Reading time in seconds. Must be greater than 0.",
         ),
         "Errors": st.column_config.NumberColumn(
             "Errors",
-            help="Number of reading errors, from 0 to 18.",
             min_value=0,
             max_value=18,
             step=1,
             format="%d",
+            help="Number of reading errors from 0 to 18.",
         ),
     },
     key="crat_editor",
@@ -533,82 +461,84 @@ st.session_state["crat_data"] = edited_df.copy()
 
 
 # ============================================================
-# Data Processing
+# Processing
 # ============================================================
 
 df = edited_df.copy()
 
 df["Time seconds"] = pd.to_numeric(df["Time seconds"], errors="coerce")
 df["Errors"] = pd.to_numeric(df["Errors"], errors="coerce").fillna(0).astype(int)
-df["Errors"] = df["Errors"].clip(lower=0, upper=N_CHARACTERS_PER_CARD)
+df["Errors"] = df["Errors"].clip(0, N_CHARACTERS_PER_CARD)
 
 df["CRS chars/min"] = df.apply(
     lambda row: calculate_reading_speed(row["Time seconds"], row["Errors"])
-    if row["Tested"]
+    if bool(row["Tested"])
     else np.nan,
     axis=1,
 )
 
-df_tested = df[df["Tested"]].copy()
+df_tested = df[df["Tested"] == True].copy()
+
 df_valid = df_tested[
-    df_tested["CRS chars/min"].notna()
-    & np.isfinite(df_tested["CRS chars/min"])
+    df_tested["Time seconds"].notna()
     & (df_tested["Time seconds"] > 0)
+    & df_tested["CRS chars/min"].notna()
+    & np.isfinite(df_tested["CRS chars/min"])
 ].copy()
 
 number_attempted = int(df_tested.shape[0])
 cumulative_errors = int(df_tested["Errors"].sum()) if number_attempted > 0 else 0
+
 cra = calculate_cra(number_attempted, cumulative_errors)
 
 fit_result = fit_reading_curve(df_valid)
-ccps, threshold_speed = calculate_ccps_from_fit(fit_result, threshold_fraction)
+
 cmrs = fit_result.get("cmrs", np.nan)
+ccps, threshold_speed = calculate_ccps(fit_result, threshold_fraction)
 
 
 # ============================================================
-# Results Summary
+# Clinical Results
 # ============================================================
 
 st.header("3. Clinical Results")
 
-metric_col_1, metric_col_2, metric_col_3, metric_col_4, metric_col_5 = st.columns(5)
+m1, m2, m3, m4, m5 = st.columns(5)
 
-with metric_col_1:
-    st.metric("Cards attempted", f"{number_attempted}")
+with m1:
+    st.metric("Cards attempted", number_attempted)
 
-with metric_col_2:
-    st.metric("Cumulative errors", f"{cumulative_errors}")
+with m2:
+    st.metric("Cumulative errors", cumulative_errors)
 
-with metric_col_3:
-    st.metric("CRA logMAR", f"{cra:.3f}" if np.isfinite(cra) else "NA")
+with m3:
+    st.metric("CRA", f"{cra:.3f} logMAR")
 
-with metric_col_4:
+with m4:
     st.metric(
-        "CMRS chars/min",
-        f"{cmrs:.1f}" if np.isfinite(cmrs) else "NA",
+        "CMRS",
+        f"{cmrs:.1f} chars/min" if np.isfinite(cmrs) else "NA",
     )
 
-with metric_col_5:
+with m5:
     st.metric(
         f"CCPS at {threshold_percent}%",
         f"{ccps:.3f} logMAR" if np.isfinite(ccps) else "NA",
     )
 
-if fit_result["message"]:
-    if fit_result["success"]:
-        st.success(fit_result["message"])
-    else:
-        st.warning(fit_result["message"])
+if fit_result["success"]:
+    st.success(fit_result["message"])
+else:
+    st.warning(fit_result["message"])
 
-if len(df_tested) > 0 and len(df_valid) < len(df_tested):
+if number_attempted > 0 and len(df_valid) < number_attempted:
     st.warning(
-        "Some tested cards have missing or invalid reading times and were excluded "
-        "from CRS calculation and curve fitting."
+        "Some tested cards have missing or invalid times and were excluded from fitting."
     )
 
 
 # ============================================================
-# Processed Data Table
+# Processed Data
 # ============================================================
 
 st.header("4. Processed Data")
@@ -624,150 +554,185 @@ st.dataframe(
 
 
 # ============================================================
-# Visualization
+# Visualization with Altair
 # ============================================================
 
 st.header("5. CRAT Reading-Speed Curve")
 
-fig, ax = plt.subplots(figsize=(12, 7))
+chart_layers = []
 
-# Plot valid observed data.
-if not df_valid.empty:
-    sns.scatterplot(
-        data=df_valid,
-        x="Print Size logMAR",
-        y="CRS chars/min",
-        s=110,
-        color="#1f77b4",
-        edgecolor="black",
-        linewidth=0.8,
-        ax=ax,
-        label="Observed CRS",
-        zorder=5,
+# Observed data
+observed_df = df_valid[
+    ["Print Size logMAR", "CRS chars/min"]
+].copy()
+
+if not observed_df.empty:
+    observed_points = (
+        alt.Chart(observed_df)
+        .mark_circle(size=100, color="#1f77b4", opacity=0.9)
+        .encode(
+            x=alt.X(
+                "Print Size logMAR:Q",
+                scale=alt.Scale(domain=[1.4, -0.4]),
+                title="Print Size logMAR",
+            ),
+            y=alt.Y(
+                "CRS chars/min:Q",
+                title="Reading Speed characters/min",
+            ),
+            tooltip=[
+                alt.Tooltip("Print Size logMAR:Q", format=".1f"),
+                alt.Tooltip("CRS chars/min:Q", format=".2f"),
+            ],
+        )
+    )
+    chart_layers.append(observed_points)
+
+# Fitted curve
+if fit_result["x_fit"] is not None and fit_result["y_fit"] is not None:
+    fit_df = pd.DataFrame(
+        {
+            "Print Size logMAR": fit_result["x_fit"],
+            "CRS chars/min": fit_result["y_fit"],
+        }
     )
 
-# Plot fitted curve.
-x_fit = fit_result.get("x_fit")
-y_fit = fit_result.get("y_fit")
-
-if x_fit is not None and y_fit is not None:
-    ax.plot(
-        x_fit,
-        y_fit,
-        color="#d62728",
-        linewidth=3,
-        label=fit_result.get("method", "Fitted curve"),
-        zorder=4,
+    fitted_curve = (
+        alt.Chart(fit_df)
+        .mark_line(color="#d62728", strokeWidth=3)
+        .encode(
+            x=alt.X(
+                "Print Size logMAR:Q",
+                scale=alt.Scale(domain=[1.4, -0.4]),
+                title="Print Size logMAR",
+            ),
+            y=alt.Y(
+                "CRS chars/min:Q",
+                title="Reading Speed characters/min",
+            ),
+            tooltip=[
+                alt.Tooltip("Print Size logMAR:Q", format=".3f"),
+                alt.Tooltip("CRS chars/min:Q", format=".2f"),
+            ],
+        )
     )
+    chart_layers.append(fitted_curve)
 
-# Horizontal CMRS line.
+# CMRS horizontal line
 if np.isfinite(cmrs):
-    ax.axhline(
-        cmrs,
-        color="#2ca02c",
-        linestyle="--",
-        linewidth=2,
-        label=f"CMRS = {cmrs:.1f} chars/min",
+    cmrs_df = pd.DataFrame(
+        {
+            "y": [cmrs],
+            "label": [f"CMRS = {cmrs:.1f} chars/min"],
+        }
     )
 
-# Horizontal threshold speed line.
+    cmrs_line = (
+        alt.Chart(cmrs_df)
+        .mark_rule(color="#2ca02c", strokeDash=[6, 4], strokeWidth=2)
+        .encode(
+            y="y:Q",
+            tooltip=["label:N"],
+        )
+    )
+    chart_layers.append(cmrs_line)
+
+# Threshold horizontal line
 if np.isfinite(threshold_speed):
-    ax.axhline(
-        threshold_speed,
-        color="#ff7f0e",
-        linestyle="--",
-        linewidth=2,
-        label=f"{threshold_percent}% CMRS = {threshold_speed:.1f}",
+    threshold_df = pd.DataFrame(
+        {
+            "y": [threshold_speed],
+            "label": [f"{threshold_percent}% CMRS = {threshold_speed:.1f} chars/min"],
+        }
     )
 
-# Vertical CCPS line.
+    threshold_line = (
+        alt.Chart(threshold_df)
+        .mark_rule(color="#ff7f0e", strokeDash=[6, 4], strokeWidth=2)
+        .encode(
+            y="y:Q",
+            tooltip=["label:N"],
+        )
+    )
+    chart_layers.append(threshold_line)
+
+# CCPS vertical line
 if np.isfinite(ccps):
-    ax.axvline(
-        ccps,
-        color="#9467bd",
-        linestyle="--",
-        linewidth=2,
-        label=f"CCPS = {ccps:.3f} logMAR",
+    ccps_df = pd.DataFrame(
+        {
+            "x": [ccps],
+            "label": [f"CCPS = {ccps:.3f} logMAR"],
+        }
     )
 
-# Vertical CRA line.
+    ccps_line = (
+        alt.Chart(ccps_df)
+        .mark_rule(color="#9467bd", strokeDash=[6, 4], strokeWidth=2)
+        .encode(
+            x="x:Q",
+            tooltip=["label:N"],
+        )
+    )
+    chart_layers.append(ccps_line)
+
+# CRA vertical line
 if np.isfinite(cra):
-    ax.axvline(
-        cra,
-        color="#8c564b",
-        linestyle=":",
-        linewidth=2.5,
-        label=f"CRA = {cra:.3f} logMAR",
+    cra_df = pd.DataFrame(
+        {
+            "x": [cra],
+            "label": [f"CRA = {cra:.3f} logMAR"],
+        }
     )
 
-# Standard vision-science inverted x-axis.
-ax.set_xlim(1.4, -0.4)
-ax.set_xticks(np.round(np.arange(1.4, -0.41, -0.1), 1))
+    cra_line = (
+        alt.Chart(cra_df)
+        .mark_rule(color="#8c564b", strokeDash=[2, 4], strokeWidth=2)
+        .encode(
+            x="x:Q",
+            tooltip=["label:N"],
+        )
+    )
+    chart_layers.append(cra_line)
 
-# Y-axis limits.
-all_y_values = []
+if chart_layers:
+    final_chart = (
+        alt.layer(*chart_layers)
+        .properties(
+            width="container",
+            height=520,
+            title="CRAT Reading Speed vs. Print Size",
+        )
+        .resolve_scale(
+            y="shared",
+            x="shared",
+        )
+        .configure_axis(
+            grid=True,
+            labelFontSize=12,
+            titleFontSize=14,
+        )
+        .configure_title(
+            fontSize=18,
+            anchor="start",
+        )
+    )
 
-if not df_valid.empty:
-    all_y_values.extend(df_valid["CRS chars/min"].dropna().tolist())
+    st.altair_chart(final_chart, use_container_width=True)
 
-if y_fit is not None:
-    all_y_values.extend(pd.Series(y_fit).dropna().tolist())
+    st.info(
+        f"""
+        **Clinical summary**
 
-if np.isfinite(cmrs):
-    all_y_values.append(cmrs)
+        Patient: {patient_id if patient_id else "Not specified"}  
+        CRA: {cra:.3f} logMAR  
+        CMRS: {cmrs:.1f} chars/min if available  
+        CCPS at {threshold_percent}%: {ccps:.3f} logMAR if available  
+        Fit method: {fit_result.get("method", "NA")}
+        """
+    )
 
-if np.isfinite(threshold_speed):
-    all_y_values.append(threshold_speed)
-
-if all_y_values:
-    y_max = max(all_y_values)
-    ax.set_ylim(bottom=0, top=max(y_max * 1.15, 10))
 else:
-    ax.set_ylim(bottom=0, top=100)
-
-ax.set_xlabel("Print Size logMAR")
-ax.set_ylabel("Reading Speed characters/min")
-ax.set_title("CRAT Reading Speed vs. Print Size")
-
-# Clinical summary text box.
-summary_text = (
-    f"Patient: {patient_id if patient_id else 'Not specified'}\n"
-    f"Date: {test_date}\n"
-    f"CRA: {cra:.3f} logMAR\n"
-    f"CMRS: {cmrs:.1f} chars/min" if np.isfinite(cmrs) else
-    f"Patient: {patient_id if patient_id else 'Not specified'}\n"
-    f"Date: {test_date}\n"
-    f"CRA: {cra:.3f} logMAR\n"
-    f"CMRS: NA"
-)
-
-summary_text += (
-    f"\nCCPS {threshold_percent}%: {ccps:.3f} logMAR"
-    if np.isfinite(ccps)
-    else f"\nCCPS {threshold_percent}%: NA"
-)
-
-ax.text(
-    0.02,
-    0.98,
-    summary_text,
-    transform=ax.transAxes,
-    fontsize=12,
-    verticalalignment="top",
-    bbox=dict(
-        boxstyle="round,pad=0.45",
-        facecolor="white",
-        edgecolor="gray",
-        alpha=0.9,
-    ),
-)
-
-ax.legend(loc="lower left", fontsize=10)
-ax.grid(True, linestyle="--", alpha=0.5)
-
-plt.tight_layout()
-
-st.pyplot(fig)
+    st.info("Enter valid CRAT data to generate the chart.")
 
 
 # ============================================================
@@ -777,9 +742,11 @@ st.pyplot(fig)
 st.header("6. Export Results")
 
 export_df = df.copy()
+
 export_df.insert(0, "Patient ID / Name", patient_id)
 export_df.insert(1, "Examiner", examiner)
 export_df.insert(2, "Test Date", str(test_date))
+
 export_df["CRA logMAR"] = cra
 export_df["CMRS chars/min"] = cmrs
 export_df[f"CCPS {threshold_percent}% logMAR"] = ccps
@@ -789,10 +756,12 @@ export_df["Fit Message"] = fit_result.get("message")
 
 csv = export_df.to_csv(index=False).encode("utf-8-sig")
 
+safe_patient_id = patient_id.replace(" ", "_") if patient_id else "patient"
+
 st.download_button(
     label="Download results as CSV",
     data=csv,
-    file_name=f"CRAT_results_{patient_id if patient_id else 'patient'}_{test_date}.csv",
+    file_name=f"CRAT_results_{safe_patient_id}_{test_date}.csv",
     mime="text/csv",
 )
 
